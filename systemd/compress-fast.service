@@ -1,0 +1,21 @@
+[Unit]
+Description=compress-fast: fast Hermes compaction summaries in front of an OpenAI-compatible model server
+After=network.target
+
+[Service]
+Type=simple
+# install.sh replaces @REPO@ with the checkout path and writes the settings file below
+WorkingDirectory=@REPO@
+Environment=COMPRESS_FAST_UPSTREAM=http://127.0.0.1:8080
+Environment=COMPRESS_FAST_PORT=8091
+Environment=COMPRESS_FAST_MODE=hybrid
+Environment=COMPRESS_FAST_HYBRID_TIMEOUT=90
+# settings from install.sh (or your own edits) override the defaults above
+EnvironmentFile=-%h/.config/compress-fast/env
+# -s: no user site-packages; -m with WorkingDirectory puts only this project on the path
+ExecStart=/usr/bin/env python3 -s -m compress_fast.server
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
