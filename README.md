@@ -19,7 +19,7 @@ points at.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/results-light.png">
-  <img alt="Wait per compaction and facts recalled: Hermes standalone 198 s / 59, hermes-vcc-engine 5 ms / 63, compress-fast 31 s / 71 facts of 71" src="docs/results-dark.png">
+  <img alt="Wait per compaction and facts recalled: compress-fast 31 s / 71, hermes-vcc-engine 5 ms / 63, Hermes standalone 198 s / 59 facts of 71" src="docs/results-dark.png">
 </picture>
 
 ## Quick start

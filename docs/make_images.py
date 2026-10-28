@@ -19,18 +19,18 @@ OUT = Path(__file__).resolve().parent
 # background matches GitHub's dark and light page colors so the chart blends in
 THEMES = {
     "dark": {"bg": "#0d1117", "accent": "#4c9be8", "gray": "#4a4f57", "ink": "#e6edf3", "muted": "#8b949e",
-             "grid": "#21262d", "on_bar": "#ffffff"},
+             "grid": "#21262d", "on_bar": "#ffffff", "on_gray": "#ffffff"},
     "light": {"bg": "#ffffff", "accent": "#2a78d6", "gray": "#b4b2a9", "ink": "#1f2328", "muted": "#656d76",
-              "grid": "#e1e0d9", "on_bar": "#ffffff"},
+              "grid": "#e1e0d9", "on_bar": "#ffffff", "on_gray": "#1f2328"},
 }
 FONT = "Inter" if any("Inter" in f.name for f in font_manager.fontManager.ttflist) else "DejaVu Sans"
 plt.rcParams.update({"font.family": FONT, "font.size": 12})
 
-# variant, seconds per compaction on large windows (mean), facts recalled of 71
+# variant, seconds per compaction on large windows (mean), facts recalled of 71; ranked, best on top
 ROWS = [
-    ("Hermes standalone", 198, 59),
-    ("hermes-vcc-engine", 0.005, 63),
     ("compress-fast (hybrid)", 31, 71),
+    ("hermes-vcc-engine", 0.005, 63),
+    ("Hermes standalone", 198, 59),
 ]
 
 
@@ -55,8 +55,9 @@ def results(theme: str) -> None:
     b.set_xlim(0, 71)
     b.set_yticks([])
     b.set_title("Facts recalled after compaction (of 71)", loc="left", fontsize=13, color=c["ink"], pad=10)
-    for yi, r in zip(y, ROWS):
-        b.text(r[2] - 2, yi, str(r[2]), va="center", ha="right", color=c["on_bar"], fontsize=11, weight="bold")
+    for yi, r, col in zip(y, ROWS, colors):
+        on = c["on_bar"] if col == c["accent"] else c["on_gray"]
+        b.text(r[2] - 2, yi, str(r[2]), va="center", ha="right", color=on, fontsize=11, weight="bold")
     for ax in (a, b):
         ax.set_facecolor(c["bg"])
         for s in ("top", "right", "left"):
