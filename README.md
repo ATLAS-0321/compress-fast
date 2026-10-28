@@ -12,7 +12,10 @@ With compress-fast it takes **about 34 seconds**, and the summary keeps **more**
 85 of 96 facts instead of 77. No Hermes patches, no plugin hooks: it is a small proxy you point
 `auxiliary.compression` at.
 
-![Wait per compaction and facts recalled: model alone 198 s / 77, VCC 5 ms / 79, rules only 10 ms / 84, hybrid 34 s / 85](docs/results.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/results-light.png">
+  <img alt="Wait per compaction and facts recalled: model alone 198 s / 77, VCC 5 ms / 79, rules only 10 ms / 84, hybrid 34 s / 85" src="docs/results-dark.png">
+</picture>
 
 ```bash
 git clone https://github.com/ATLAS-0321/compress-fast && cd compress-fast
