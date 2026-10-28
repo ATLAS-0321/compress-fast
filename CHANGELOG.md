@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Repository housekeeping: CI tests on Python 3.10-3.13, issue templates (bug report, Hermes update
-  compatibility), PR template, SECURITY.md, Dependabot for the CI actions.
+  compatibility), PR template, SECURITY.md, Dependabot for the CI actions, CODEOWNERS.
 
 ## 0.3.0 - 2026-10-28
 
