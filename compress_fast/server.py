@@ -6,7 +6,8 @@ OpenAI-compatible model server, including streaming responses.
 
 Modes (COMPRESS_FAST_MODE):
   hybrid  rules for the facts, the upstream model writes the four reasoning sections from a small
-          digest (COMPRESS_FAST_HYBRID_TIMEOUT, default 90 s, then rules alone) (default)
+          digest (COMPRESS_FAST_HYBRID_TIMEOUT, default 90 s; sections unfinished by then stay rules
+          only) (default)
   serve   answer recognised compaction prompts by rules alone, no model call
   shadow  forward everything to upstream, but also build the rule summary and store prompt,
           rule summary and model summary side by side for comparison
@@ -32,8 +33,29 @@ MODE = os.environ.get("COMPRESS_FAST_MODE", "hybrid")
 MODEL = os.environ.get("COMPRESS_FAST_MODEL", "")
 SHADOW_DIR = Path(os.environ.get("COMPRESS_FAST_SHADOW_DIR", str(Path.home() / ".hermes" / "compress-fast-shadow")))
 UPSTREAM_TIMEOUT = float(os.environ.get("COMPRESS_FAST_UPSTREAM_TIMEOUT", "1800"))
-# hybrid: the model writes the reasoning sections; past this many seconds the rule summary goes out alone
+# hybrid: the model writes the reasoning sections; past this many seconds the sections it has finished are
+# used and the rest stays rules only
 HYBRID_TIMEOUT = float(os.environ.get("COMPRESS_FAST_HYBRID_TIMEOUT", "90"))
+# hybrid: token cap for that answer; a section cut off by it is dropped
+HYBRID_MAX_TOKENS = int(os.environ.get("COMPRESS_FAST_HYBRID_MAX_TOKENS", str(hybrid.MAX_TOKENS)))
+
+
+def _json_object_env(name: str) -> dict:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} is not valid JSON ({exc}): {raw}") from None
+    if not isinstance(value, dict) or {"model", "messages", "stream"} & set(value):
+        raise ValueError(f"{name} must be a JSON object without model, messages or stream: {raw}")
+    return value
+
+
+# hybrid: extra request fields for that call, e.g. {"top_k": 20}. Left out again when the server rejects the
+# request.
+HYBRID_EXTRA_BODY = _json_object_env("COMPRESS_FAST_HYBRID_EXTRA_BODY")
 
 HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                "proxy-authorization", "proxy-authenticate", "host", "content-length"}
@@ -86,7 +108,9 @@ class Handler(BaseHTTPRequestHandler):
                     if MODE == "hybrid":
                         model = body.get("model") or MODEL
                         summary, info = hybrid.summarize_hybrid(prompt, UPSTREAM, model, HYBRID_TIMEOUT,
-                                                                auth=self.headers.get("Authorization"))
+                                                                auth=self.headers.get("Authorization"),
+                                                                max_tokens=HYBRID_MAX_TOKENS,
+                                                                extra_body=HYBRID_EXTRA_BODY)
                         diag.log.info("hybrid info: %s", info)
                     else:
                         summary = summarizer.summarize(prompt)
@@ -223,8 +247,9 @@ def main() -> None:
     diag.setup()
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.daemon_threads = True
-    diag.log.info("compress-fast %s listening on %s:%d, mode=%s, upstream=%s",
-                  __version__, LISTEN_HOST, LISTEN_PORT, MODE, UPSTREAM)
+    diag.log.info("compress-fast %s listening on %s:%d, mode=%s, upstream=%s, hybrid timeout=%.0f s max_tokens=%d "
+                  "extra fields=%s", __version__, LISTEN_HOST, LISTEN_PORT, MODE, UPSTREAM, HYBRID_TIMEOUT,
+                  HYBRID_MAX_TOKENS, sorted(HYBRID_EXTRA_BODY) or "none")
     server.serve_forever()
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from . import diag
 
@@ -39,7 +40,9 @@ TOOL_CALLS_RE = re.compile(r"(?:^|\n)\[Tool calls:\n(.*?)(?:\n\]\s*)?$", re.S)
 RESULT_PATH_RE = re.compile(r"^\[[a-z_]+\] (?:replace in|wrote to|read|created|edited|patched) (/\S+)")
 DIFF_PATH_RE = re.compile(r'"diff": "--- a/(/[^"\\\s]+)')
 CALL_LINE_RE = re.compile(r"^  ([A-Za-z0-9_.:\-]+)\((.*)$")
-ELISION_RE = re.compile(r"\.\.\.\[records [\d,]+-[\d,]+: [\d,]+ chars elided[^\]]*\]\.\.\.")
+# lean tail mode samples oversized input ("records ... elided"); the legacy mode cuts the middle once
+ELISION_RE = re.compile(r"\.\.\.\[(?:records [\d,]+-[\d,]+: [\d,]+ chars elided|summary input truncated: omitted [\d,]+ chars)"
+                        r"[^\]]*\]\.\.\.")
 SKILL_PRUNED_RE = re.compile(r"\[SKILL_PRUNED:[^\]]*\]")
 TARGET_TOKENS_RE = re.compile(r"Target ~(\d+) tokens")
 PATH_RE = re.compile(r"(?<![\w.])((?:~|/)[\w.\-+@]+(?:/[\w.\-+@]+)+)")
@@ -52,7 +55,43 @@ WRITE_TOOLS = {"write_file", "patch", "edit_file", "str_replace", "create_file",
 READ_TOOLS = {"read_file", "view_file", "skill_view", "cat", "open_file", "search_files", "grep", "list_files"}
 TARGET_KEYS = ("path", "file_path", "filename", "file", "target", "url", "name", "query", "skill", "pattern")
 
-CHARS_PER_TOKEN = 3.6
+# Measured with the Qwen3.8 tokenizer, 8 rule and hybrid summaries over 3000 tokens: 2.81-3.29 chars per token
+# (paths, commands and code are dense). The lowest keeps every measured summary within Hermes' target.
+CHARS_PER_TOKEN = 2.8
+
+# Section caps as shares of the summary budget (chars). At Hermes' usual 7000-token target they are close to
+# the fixed caps of 0.3.0. The session log takes what is left, at least its "log" share.
+SECTION_SHARE = {
+    "## Goal": 0.10, "## Constraints & Preferences": 0.36, "## Completed Actions": 0.40, "## Key Decisions": 0.24,
+    # Critical Context: the fixed 12000 of 0.3.0 never applied (largest measured 4063 chars)
+    "## Errors & Fixes": 0.16, "## Resolved Questions": 0.12, "## Relevant Files": 0.16, "## Critical Context": 0.25,
+    "log": 0.08,            # minimum for the session log
+    "last_message": 0.12,   # last substantial assistant message, verbatim in Critical Context
+}
+# When the summary is over its target, caps shrink tier by tier, each down to its floor factor: first what is
+# repeated elsewhere (log, the verbatim last message, answers to questions), then the assistant's notes and the
+# file lists (read-only files go first), then actions and errors (older actions fold per target), last the
+# constraints, where a cut takes the entries of earlier summaries first (this window's user turns are at the end).
+# The goal never shrinks.
+SHRINK_TIERS = (
+    (("log", "last_message", "## Resolved Questions"), 0.15),
+    (("## Key Decisions", "## Relevant Files", "## Critical Context"), 0.3),
+    (("## Completed Actions", "## Errors & Fixes"), 0.6),
+    (("## Constraints & Preferences",), 0.5),
+)
+# Completed Actions may grow past its share to this much of the budget, so that every action keeps its short line
+# (177 calls with long commands needed 56 % in one measured window)
+ACTIONS_MAX_SHARE = 0.6
+WD_SECTIONS = ("## Completed Actions", "## Active State", "## Blocked", "## Errors & Fixes")
+# hybrid: label in front of the rule text that follows the model's own text in a section
+MODEL_SECTION_LABELS = {
+    "## Constraints & Preferences": "User turns (verbatim, rules):",
+    "## Active State": "Recorded state (rules):",
+    "## Key Decisions": "Assistant notes (rules):",
+    "## Errors & Fixes": "Recorded failures (rules):",
+}
+ORIGIN_NOTE_RE = re.compile(r"(?m)^(?:This summary was built by rules|Facts in this summary were extracted by rules).*\n?")
+USER_TURNS_NOTE_RE = re.compile(r"(?m)^- \(All \d+ user turns? of this window are quoted above in full[^\n]*\n?")
 
 
 @dataclass
@@ -66,12 +105,14 @@ class Call:
     ok: bool | None = None
     error: str = ""
     result_excerpt: str = ""
-    wd: str = ""                # working directory shortened to $WD before truncating
+    abbrevs: tuple = ()         # (directory, name) pairs, longest first; shortened before truncating
 
     def _short(self, text: str) -> str:
-        return text.replace(self.wd + "/", "$WD/").replace(self.wd, "$WD") if self.wd else text
+        return _abbreviate(text, self.abbrevs)
 
-    @property
+    # cached: a summary build reads it tens of thousands of times. extract() may still fill args["path"]
+    # from the result, so nothing may read it before extract() has finished.
+    @cached_property
     def target(self) -> str:
         if self.tool in ("terminal", "shell", "bash", "run_command", "execute"):
             cmd = self._short(str(self.args.get("command") or self.args.get("cmd") or ""))
@@ -305,7 +346,8 @@ def _output_gist(text: str, limit: int = 280) -> str:
     return _one_line(f"{lines[0]} | ... | {lines[-2]} | {lines[-1]}", limit)
 
 
-EXC_RE = re.compile(r"\b([A-Z][A-Za-z]*(?:Error|Exception)): ([^\n\"\\]{3,200})")
+# not \b: in escaped output (JSON in JSON) the name follows a literal "\n", which \b does not see as a boundary
+EXC_RE = re.compile(r"(?:(?<![A-Za-z0-9_])|(?<=\\n)|(?<=\\t))([A-Z][A-Za-z]*(?:Error|Exception)): ([^\n\"\\]{3,200})")
 EXC_PAIR_RE = re.compile(r'exception_type\W+(\w+)\W+message\W+(.{3,200}?)\\*"')
 
 
@@ -339,23 +381,68 @@ class Facts:
     calls: list[Call] = field(default_factory=list)
     files_read: dict[str, int] = field(default_factory=dict)
     files_written: dict[str, int] = field(default_factory=dict)
-    log: list = field(default_factory=list)   # str, or Call (rendered once its result and path are known)
+    # str, (role, text) or Call; rendered by render_log once results, paths and the other sections are known
+    log: list = field(default_factory=list)
     skill_markers: list[str] = field(default_factory=list)
     questions: list[tuple[str, str]] = field(default_factory=list)
+    exceptions: list[str] = field(default_factory=list)  # every "SomeError: message" name in the window
 
 
-def render_log(f: Facts) -> list[str]:
-    out = []
-    for item in f.log:
-        if isinstance(item, Call):
-            out.append(f"- -> {item.tool}: {item.target}")
-            out.append(f"- <- {item.tool}: {_one_line(item._short(item.outcome), 220)}")
-        else:
-            out.append(item)
-    return out
+def render_log(f: Facts, quoted: str = "") -> list[str]:
+    """Chronological log. Every call is listed in Completed Actions, so the calls between two messages
+    become one line with their action numbers and outcome counts. A user or assistant message whose
+    log text already stands in `quoted` (the other sections) keeps only its start here."""
+    with diag.timer("render_log"):
+        out: list[str] = []
+        run: list[Call] = []
+        shortened = 0
+        for item in f.log + [None]:
+            if isinstance(item, Call):
+                run.append(item)
+                continue
+            if run:
+                out.append(_log_run(run))
+                run = []
+            if item is None:
+                break
+            if isinstance(item, tuple):
+                role, text = item
+                limit = 400 if role == "user" else 300
+                flat = " ".join(text.split())
+                if quoted and len(flat) > 160 and flat[: limit - 3] in quoted:
+                    out.append(f"- {role}: {_one_line(flat, 160)} (quoted above)")
+                    shortened += 1
+                else:
+                    out.append(f"- {role}: {_one_line(text, limit)}")
+            else:
+                out.append(item)
+        diag.count("render_log.messages_shortened", shortened)
+        return out
 
 
-def extract(parsed: Parsed, first_action: int, wd: str = "") -> Facts:
+def _log_run(calls: list[Call]) -> str:
+    """One log line for consecutive calls: action numbers, tools, outcome counts, failed targets."""
+    first, last = calls[0], calls[-1]
+    if len(calls) == 1:
+        state = "ok" if first.ok else "FAILED" if first.ok is False else "outcome unknown"
+        return f"- action #{first.index} {first.tool} {_one_line(first.target, 100)}: {state}"
+    tools: dict[str, int] = {}
+    for c in calls:
+        tools[c.tool] = tools.get(c.tool, 0) + 1
+    kinds = ", ".join(f"{t} x{n}" if n > 1 else t for t, n in sorted(tools.items(), key=lambda kv: -kv[1])[:3])
+    kinds += ", ..." if len(tools) > 3 else ""
+    failed = [c for c in calls if c.ok is False]
+    ok = sum(1 for c in calls if c.ok)
+    parts = [f"{ok} ok"] if ok else []
+    if failed:
+        parts.append(f"{len(failed)} FAILED (" + ", ".join(f"#{c.index} {c.tool} {_one_line(c.target, 60)}"
+                                                           for c in failed[:3]) + (", ..." if len(failed) > 3 else "") + ")")
+    if len(calls) - ok - len(failed):
+        parts.append(f"{len(calls) - ok - len(failed)} outcome unknown")
+    return f"- actions #{first.index}-#{last.index} ({kinds}): {', '.join(parts)}"
+
+
+def extract(parsed: Parsed, first_action: int, abbrevs: tuple = ()) -> Facts:
     with diag.timer("extract"):
         f = Facts()
         pending: list[Call] = []
@@ -376,20 +463,20 @@ def extract(parsed: Parsed, first_action: int, wd: str = "") -> Facts:
                     diag.count("extract.duplicate_user_rows")
                     continue
                 f.users.append(text)
-                f.log.append(f"- user: {_one_line(text, 400)}")
+                f.log.append(("user", text))
                 open_question = text if "?" in text else None
             elif role == "ASSISTANT":
                 text, calls = _parse_calls(content)
                 if text:
                     f.assistant_notes.append((pos, text))
-                    f.log.append(f"- assistant: {_one_line(text, 300)}")
+                    f.log.append(("assistant", text))
                     if open_question:
                         f.questions.append((open_question, text))
                         open_question = None
                 for c in calls:
                     c.record = pos
                     c.index = first_action + len(f.calls)
-                    c.wd = wd
+                    c.abbrevs = abbrevs
                     f.calls.append(c)
                     f.log.append(c)
                     _note_files(f, c)
@@ -409,6 +496,7 @@ def extract(parsed: Parsed, first_action: int, wd: str = "") -> Facts:
                     f.log.append(f"- <- tool: {_one_line(outcome, 220)}")
             else:
                 f.log.append(f"- {role.lower()}: {_one_line(content, 200)}")
+        f.exceptions = sorted({m.group(1) for _, content in parsed.records for m in EXC_RE.finditer(content)})
         diag.count("extract.calls", len(f.calls))
         diag.count("extract.records", len(parsed.records))
         return f
@@ -464,6 +552,8 @@ def _merge(previous: str, new: str, limit: int) -> str:
     seen = set(prev_lines)
     new_lines = [ln for ln in new.splitlines() if ln.strip() and ln not in seen]
     lines = prev_lines + new_lines
+    if sum(len(ln) + 1 for ln in lines) > limit:
+        limit -= 70  # room for the "(older N line(s) dropped ...)" note
     out, size = [], 0
     for ln in reversed(lines):
         size += len(ln) + 1
@@ -477,17 +567,82 @@ def _merge(previous: str, new: str, limit: int) -> str:
     return "\n".join(out) if out else "None."
 
 
-def build_summary(parsed: Parsed) -> str:
+def build_summary(parsed: Parsed, model_sections: dict[str, str] | None = None) -> str:
+    """Rule summary fitted to Hermes' target size. With model_sections (hybrid) the model's text opens those
+    sections and the rule text follows under a label; the caps then shrink to make room for it."""
     with diag.timer("build_summary"):
-        prev = _expand_wd(_previous_sections(parsed.previous)) if parsed.mode == "update" else {}
+        prev = _expand_abbrevs(_previous_sections(parsed.previous)) if parsed.mode == "update" else {}
         first_action = _last_action_number(prev.get("## Completed Actions", "")) + 1
         f = extract(parsed, first_action)
-        wd = _common_dir(f)
-        if wd:  # second pass so every target is shortened before it is truncated
-            f = extract(parsed, first_action, wd)
+        abbrevs = _abbreviations(f)
+        if abbrevs:  # second pass so every target is shortened before it is truncated
+            f = extract(parsed, first_action, abbrevs)
         budget_chars = int(parsed.target_tokens * CHARS_PER_TOKEN)
-        sec: dict[str, str] = {}
+        model_sections = model_sections or {}
+        summary = _render(parsed, prev, f, abbrevs, budget_chars, _shrink_factors(1.0), model_sections)
+        if len(summary) > budget_chars:
+            # the highest shrink level that fits: caps shrink only as far as needed
+            diag.count("build.shrunk")
+            level = 0.0
+            summary = _render(parsed, prev, f, abbrevs, budget_chars, _shrink_factors(level), model_sections)
+            if len(summary) <= budget_chars:
+                lo, hi = 0.0, 1.0
+                for _ in range(7):
+                    mid = (lo + hi) / 2
+                    candidate = _render(parsed, prev, f, abbrevs, budget_chars, _shrink_factors(mid), model_sections)
+                    if len(candidate) <= budget_chars:
+                        lo, summary, level = mid, candidate, mid
+                    else:
+                        hi = mid
+            else:
+                # verbatim parts (memory provider context, user turns, model text) are never cut
+                diag.count("build.over_budget")
+                diag.log.info("summary %d chars over its budget of %d (target %d tokens) with every cap at its floor",
+                              len(summary), budget_chars, parsed.target_tokens)
+            diag.log.debug("summary fitted at shrink level %.3f: %d of %d chars", level, len(summary), budget_chars)
+        unknown = [h for h in parsed.headings if h not in RULE_HEADINGS and "SKILL" not in h.upper() and "Pruned" not in h]
+        diag.count("build.unknown_heading", len(unknown))
+        if parsed.no_user and re.search(r"\bUser\s+asked\s*:", summary, re.I):
+            summary = re.sub(r"\bUser\s+asked\s*:", "Request:", summary, flags=re.I)
+            diag.count("build.no_user_rewrite")
+        diag.count("build.ok")
+        diag.count("build.chars", len(summary))
+        return summary
 
+
+RULE_HEADINGS = (HISTORICAL, "## Goal", "## Constraints & Preferences", "## Completed Actions", "## Active State",
+                 "## Blocked", "## Key Decisions", "## Errors & Fixes", "## Resolved Questions", "## Relevant Files",
+                 "## Critical Context", SESSION_LOG)
+
+
+def _abbreviate(text: str, abbrevs: tuple) -> str:
+    """Directory -> name, longest directory first, only where the path ends or goes on with "/"."""
+    for path, name in abbrevs:
+        text = re.sub(re.escape(path) + r"(?![\w.\-+@])", lambda _m, n=name: n, text)
+    return text
+
+
+def _shrink_factors(level: float) -> dict[str, float]:
+    """Cap factor per SECTION_SHARE key. Level 1.0: every cap at its share. Going down to 0.0, the tiers of
+    SHRINK_TIERS shrink one after the other, each down to its floor factor."""
+    factors = {}
+    n = len(SHRINK_TIERS)
+    for i, (keys, floor) in enumerate(SHRINK_TIERS):
+        # tier i shrinks while the level falls from 1 - i/n to 1 - (i+1)/n
+        t = min(1.0, max(0.0, (level - (1 - (i + 1) / n)) * n))
+        for key in keys:
+            factors[key] = floor + (1 - floor) * t
+    return factors
+
+
+def _render(parsed: Parsed, prev: dict[str, str], f: Facts, abbrevs: tuple, budget_chars: int,
+            factors: dict[str, float], model: dict[str, str]) -> str:
+    """One summary with the section caps at their shares times `factors`; the session log takes the rest."""
+    with diag.timer("build_summary.render"):
+        def cap(key: str) -> int:
+            return int(budget_chars * SECTION_SHARE[key] * factors.get(key, 1.0))
+
+        sec: dict[str, str] = {}
         if parsed.no_user:
             sec[HISTORICAL] = NO_USER_SENTINEL
         else:
@@ -504,26 +659,35 @@ def build_summary(parsed: Parsed) -> str:
                         "Continue the work recorded below (no user message in this part of the session).")
         sec["## Goal"] = prev.get("## Goal") or goal_new or "None recorded."
         if prev.get("## Goal") and f.users and not parsed.no_user:
-            sec["## Goal"] = _merge(prev["## Goal"], "Latest instruction: " + _one_line(f.users[-1], 800), 2500)
+            # never shrunk: the goal is short, and cutting it drops its oldest line, the original task
+            sec["## Goal"] = _merge(prev["## Goal"], "Latest instruction: " + _one_line(f.users[-1], 800),
+                                    int(budget_chars * SECTION_SHARE["## Goal"]))
 
         # Rules often sit at the END of a long instruction ("ab jetzt gilt ..."): keep user turns nearly whole.
         constraints = "\n".join(f"- User said: {_one_line(u, 1500)}" for u in f.users[-12:]) if not parsed.no_user else ""
-        sec["## Constraints & Preferences"] = _merge(prev.get("## Constraints & Preferences", ""), constraints, 9000)
+        # an earlier window's completeness note no longer holds once its quotes may have been cut
+        prev_constraints = USER_TURNS_NOTE_RE.sub("", prev.get("## Constraints & Preferences", ""))
+        sec["## Constraints & Preferences"] = _merge(prev_constraints, constraints, cap("## Constraints & Preferences"))
+        sec["## Constraints & Preferences"] += _user_turns_note(parsed, f, sec["## Constraints & Preferences"])
 
-        act_limit = int(budget_chars * 0.40)
+        # every action keeps at least its short line (command, ok/FAILED), up to ACTIONS_MAX_SHARE of the budget;
+        # what that needs beyond the share comes out of the other sections through the shrink tiers
+        act_limit = max(cap("## Completed Actions"), min(_short_lines_size(f.calls), int(budget_chars * ACTIONS_MAX_SHARE)))
         sec["## Completed Actions"] = _merge(prev.get("## Completed Actions", ""), _fit_actions(f.calls, act_limit), act_limit)
         sec["## Active State"] = _active_state(f)
         sec["## Blocked"] = _blocked(f)
         # the agent's own notes between tool calls carry the reasons; keep them nearly whole.
         notes = "\n".join(f"- Assistant noted: {_one_line(t, 600)}" for _, t in f.assistant_notes[-10:])
-        sec["## Key Decisions"] = _merge(prev.get("## Key Decisions", ""), notes, 6000)
-        sec["## Errors & Fixes"] = _merge(prev.get("## Errors & Fixes", ""), _errors_fixes(f), 4000)
+        sec["## Key Decisions"] = _merge(prev.get("## Key Decisions", ""), notes, cap("## Key Decisions"))
+        errors = _merge(prev.get("## Errors & Fixes", ""), _errors_fixes(f), cap("## Errors & Fixes"))
+        # added after the cap: the note is short, and with it a reader can rule out errors that are not named
+        sec["## Errors & Fixes"] = ("" if errors == "None." else errors + "\n") + _exceptions_note(parsed, f)
         if parsed.no_user:
             sec["## Resolved Questions"] = prev.get("## Resolved Questions") or "None."
         else:
             qa = "\n".join(f"- Q: {_one_line(q, 240)} -> A: {_one_line(a, 300)}" for q, a in f.questions[-6:])
-            sec["## Resolved Questions"] = _merge(prev.get("## Resolved Questions", ""), qa, 3000)
-        sec["## Relevant Files"] = _merge(prev.get("## Relevant Files", ""), _files(f), 4000)
+            sec["## Resolved Questions"] = _merge(prev.get("## Resolved Questions", ""), qa, cap("## Resolved Questions"))
+        sec["## Relevant Files"] = _merge(prev.get("## Relevant Files", ""), _files(f), cap("## Relevant Files"))
         critical = []
         if parsed.focus:
             critical.append("Compaction focus (from Hermes, verbatim):\n" + parsed.focus)
@@ -532,27 +696,57 @@ def build_summary(parsed: Parsed) -> str:
         answers = [t for _, t in f.assistant_notes if len(t) >= 300]
         if answers:
             # the last substantial assistant message is usually the result handed to the user
-            critical.append("Last substantial assistant message (verbatim, may be cut):\n" + answers[-1][:3000])
+            critical.append("Last substantial assistant message (verbatim, may be cut):\n" + answers[-1][:cap("last_message")])
         if parsed.elided_notes:
             critical.append(f"{len(parsed.elided_notes)} block(s) of records were elided by Hermes before summarizing; "
                             "recover them via session_search.")
-        critical.append("This summary was built by rules from the recorded messages (no model call); "
-                        "reasons behind decisions survive only as quoted assistant notes.")
-        prev_critical = prev.get("## Critical Context", "")
+        if model:
+            critical.append("Facts in this summary were extracted by rules from the recorded messages; the opening text of "
+                            + ", ".join(h[3:] for h in model) + " was written by the model from a digest of them.")
+        else:
+            critical.append("This summary was built by rules from the recorded messages (no model call); "
+                            "reasons behind decisions survive only as quoted assistant notes.")
+        # the note on how the summary was built describes this summary only
+        prev_critical = ORIGIN_NOTE_RE.sub("", prev.get("## Critical Context", ""))
         prev_critical = re.sub(r"(?s)Memory provider context \(verbatim\):.*?(?=\n\S|\Z)", "", prev_critical) if parsed.memory else prev_critical
-        sec["## Critical Context"] = _merge(prev_critical, "\n".join(critical), 12000) if prev_critical else "\n".join(critical)
+        sec["## Critical Context"] = (_merge(prev_critical, "\n".join(critical), cap("## Critical Context"))
+                                      if prev_critical.strip() else "\n".join(critical))
 
-        sec[SESSION_LOG] = "\n".join(render_log(f))
-        if wd:
-            # one long working directory repeated on every line is pure noise; name it once
+        for heading, text in model.items():
+            rule_text = sec.get(heading, "")
+            if rule_text and (heading == "## Active State" or not rule_text.startswith("None")):
+                text = f"{text}\n\n{MODEL_SECTION_LABELS[heading]}\n{rule_text}"
+            sec[heading] = text.strip()
+
+        if abbrevs:
+            # long directories repeated on every line are pure noise; name them once
             # Relevant Files keeps full paths: it is the list the model and session_search look up.
-            for key in ("## Completed Actions", "## Active State", "## Blocked", "## Errors & Fixes", SESSION_LOG):
-                sec[key] = sec[key].replace(wd + "/", "$WD/").replace(wd, "$WD")
-            sec["## Active State"] = f"- $WD = {wd} (working directory of this part of the session)\n" + sec["## Active State"]
-        used = sum(len(v) for k, v in sec.items() if k != SESSION_LOG)
-        log_budget = max(2000, budget_chars - used)
-        sec[SESSION_LOG] = _merge(prev.get(SESSION_LOG, ""), sec[SESSION_LOG], log_budget)
+            for key in WD_SECTIONS:
+                sec[key] = _abbreviate(sec[key], abbrevs)
+            defs = []
+            for path, name in sorted(abbrevs, key=lambda a: a[1] != "$WD"):
+                what = "working directory of this part of the session" if name == "$WD" else "used in commands and paths below"
+                defs.append(f"- {name} = {path} ({what})\n")
+            sec["## Active State"] = "".join(defs) + sec["## Active State"]
+
+        log_new = _abbreviate("\n".join(render_log(f, "\n".join(sec.values()))), abbrevs)
+        log_prev = prev.get(SESSION_LOG, "")
         markers = list(dict.fromkeys(f.skill_markers + SKILL_PRUNED_RE.findall(parsed.previous)))
+        # headings, blank lines and the pruned-skill block count towards the target too
+        overhead = sum(len(h) + 3 for h in parsed.headings) + sum(len(m) + 1 for m in markers)
+        used = sum(len(v) for v in sec.values()) + overhead
+        log_budget = max(cap("log"), budget_chars - used)
+        slack = log_budget - len(_merge(log_prev, log_new, budget_chars * 10))
+        actions = sec["## Completed Actions"]
+        if slack > 0 and any(m in actions for m in ("Older actions ", "Earlier actions ", "line(s) dropped for size")):
+            # the compact log left room: shorten fewer of the older actions
+            act_limit += slack
+            sec["## Completed Actions"] = _abbreviate(
+                _merge(prev.get("## Completed Actions", ""), _fit_actions(f.calls, act_limit), act_limit), abbrevs)
+            diag.count("build.actions_widened")
+            used = sum(len(v) for v in sec.values()) + overhead
+            log_budget = max(cap("log"), budget_chars - used)
+        sec[SESSION_LOG] = _merge(log_prev, log_new, log_budget)
 
         out = []
         for heading in parsed.headings:
@@ -563,14 +757,7 @@ def build_summary(parsed: Parsed) -> str:
                     out.append(heading + "\n" + "\n".join(markers))
             else:
                 out.append(f"{heading}\n{prev.get(heading) or 'None recorded.'}")
-                diag.count("build.unknown_heading")
-        summary = "\n\n".join(out).strip()
-        if parsed.no_user and re.search(r"\bUser\s+asked\s*:", summary, re.I):
-            summary = re.sub(r"\bUser\s+asked\s*:", "Request:", summary, flags=re.I)
-            diag.count("build.no_user_rewrite")
-        diag.count("build.ok")
-        diag.count("build.chars", len(summary))
-        return summary
+        return "\n\n".join(out).strip()
 
 
 def _actions(calls: list[Call]) -> str:
@@ -579,7 +766,10 @@ def _actions(calls: list[Call]) -> str:
     while i < len(calls):
         c = calls[i]
         j = i
-        while j + 1 < len(calls) and calls[j + 1].tool == c.tool and calls[j + 1].target == c.target and calls[j + 1].ok == c.ok:
+        # repeats of a call fold into one line with the last outcome; every file change keeps its own line,
+        # its outcome (diff size, changed definitions) differs from call to call
+        while (c.tool not in WRITE_TOOLS and j + 1 < len(calls) and calls[j + 1].tool == c.tool
+               and calls[j + 1].target == c.target and calls[j + 1].ok == c.ok):
             j += 1
         repeat = f" (x{j - i + 1}, through #{calls[j].index})" if j > i else ""
         last = calls[j]
@@ -588,32 +778,74 @@ def _actions(calls: list[Call]) -> str:
     return "\n".join(lines)
 
 
+def _compact_actions(calls: list[Call]) -> str:
+    """One line per call (repeats of a call collapse): number, tool, target and the outcome without output."""
+    lines = []
+    i = 0
+    while i < len(calls):
+        c, j = calls[i], i
+        while (c.tool not in WRITE_TOOLS and j + 1 < len(calls) and calls[j + 1].tool == c.tool
+               and calls[j + 1].target == c.target and calls[j + 1].ok == c.ok):
+            j += 1
+        last = calls[j]
+        state = ("ok" if c.ok else f"FAILED: {_one_line(last.error or last.outcome, 100)}" if c.ok is False
+                 else "outcome unknown")
+        repeat = f" (x{j - i + 1}, through #{last.index})" if j > i else ""
+        lines.append(f"{c.index}. {c.tool} {c.target}: {state}{repeat}")
+        i = j + 1
+    return "\n".join(lines)
+
+
+def _folded_actions(calls: list[Call]) -> str:
+    """One line per target with ok/failed/unknown counts and the last outcome."""
+    groups: dict[tuple[str, str], list[Call]] = {}
+    for c in calls:
+        groups.setdefault((c.tool, _one_line(c.target, 110)), []).append(c)
+    lines = [f"Earlier actions {calls[0].index}-{calls[-1].index}, folded per target (ok/failed/unknown, last outcome):"]
+    for (tool, target), cs in groups.items():
+        ok = sum(1 for c in cs if c.ok)
+        bad = sum(1 for c in cs if c.ok is False)
+        last = cs[-1]
+        lines.append(f"- {tool} {target}: {len(cs)}x ({ok}/{bad}/{len(cs) - ok - bad}), last #{last.index} "
+                     f"{'ok' if last.ok else 'FAILED' if last.ok is False else 'unknown'}"
+                     + (f": {_one_line(last.error, 120)}" if last.ok is False and last.error else ""))
+    return "\n".join(lines)
+
+
+def _short_lines_size(calls: list[Call]) -> int:
+    """Size of the smallest list that still names every action: short lines, the newest 4 in full."""
+    if len(calls) <= 4:
+        return len(_actions(calls))
+    return len(f"Older actions {calls[0].index}-{calls[-5].index}, outcome only:\n") + len(_compact_actions(calls[:-4])) \
+        + 1 + len(_actions(calls[-4:]))
+
+
 def _fit_actions(calls: list[Call], limit: int) -> str:
-    """Full action lines; when they do not fit, fold the oldest into one line per target with counts
-    instead of dropping them, so 'did X succeed' stays answerable for the whole window."""
+    """Every action stays answerable ('did X succeed') within `limit`, in three tiers: the newest with their
+    output excerpt, older ones as one short line each (command and ok/FAILED), the oldest folded per target."""
     full = _actions(calls)
     if len(full) <= limit or len(calls) < 8:
         return full
     keep = len(calls)
     while keep > 4:
-        keep = int(keep * 0.7)
+        keep = max(4, int(keep * 0.7))
         older, newer = calls[:-keep], calls[-keep:]
-        groups: dict[tuple[str, str], list[Call]] = {}
-        for c in older:
-            groups.setdefault((c.tool, _one_line(c.target, 110)), []).append(c)
-        lines = [f"Earlier actions {older[0].index}-{older[-1].index}, folded per target (ok/failed/unknown, last outcome):"]
-        for (tool, target), cs in groups.items():
-            ok = sum(1 for c in cs if c.ok)
-            bad = sum(1 for c in cs if c.ok is False)
-            unk = len(cs) - ok - bad
-            last = cs[-1]
-            lines.append(f"- {tool} {target}: {len(cs)}x ({ok}/{bad}/{unk}), last #{last.index} "
-                         f"{'ok' if last.ok else 'FAILED' if last.ok is False else 'unknown'}"
-                         + (f": {_one_line(last.error, 120)}" if last.ok is False and last.error else ""))
-        text = "\n".join(lines) + "\n" + _actions(newer)
+        text = f"Older actions {older[0].index}-{older[-1].index}, outcome only:\n{_compact_actions(older)}\n{_actions(newer)}"
         if len(text) <= limit:
-            diag.count("build.actions_folded")
+            diag.count("build.actions_compact")
             return text
+    # even one short line per action is too long: fold the oldest per target, the rest stays one line each
+    older, newer = calls[:-4], calls[-4:]
+    for share in (0.2, 0.4, 0.6, 0.8, 1.0):
+        n = max(1, int(len(older) * share))
+        folded, compact = older[:n], older[n:]
+        text = _folded_actions(folded) + "\n"
+        if compact:
+            text += f"Older actions {compact[0].index}-{compact[-1].index}, outcome only:\n{_compact_actions(compact)}\n"
+        text += _actions(newer)
+        if len(text) <= limit:
+            break
+    diag.count("build.actions_folded")
     return text
 
 
@@ -632,6 +864,26 @@ def _errors_fixes(f: Facts) -> str:
             tail = f"fixed: same call succeeded at action {fix.index}" if fix else "no identical successful retry in this window"
             lines.append(f"- action {c.index} {c.tool} {c.target}: {c.error or c.outcome} -> {tail}")
     return "\n".join(lines[-25:])
+
+
+def _user_turns_note(parsed: Parsed, f: Facts, section: str) -> str:
+    """A completeness line, only when every user turn of the window stands uncut in `section`."""
+    if parsed.no_user or not f.users:
+        return ""
+    if all(" ".join(u.split()) in section for u in f.users):
+        diag.count("build.user_turns_complete")
+        n = len(f.users)
+        return f"\n- (All {n} user turn{'s' if n > 1 else ''} of this window are quoted above in full, whitespace collapsed.)"
+    diag.count("build.user_turns_cut")
+    return ""
+
+
+def _exceptions_note(parsed: Parsed, f: Facts) -> str:
+    """Every exception name of the window: what is not named here did not occur in the records Hermes passed on."""
+    span = f"actions #{f.calls[0].index}-#{f.calls[-1].index}" if f.calls else "no actions"
+    scope = f", not counting the {len(parsed.elided_notes)} block(s) Hermes elided" if parsed.elided_notes else ""
+    return (f"- Every exception reported as 'Name: message' in this window ({span}{scope}): "
+            + (", ".join(f.exceptions) if f.exceptions else "none"))
 
 
 def _blocked(f: Facts) -> str:
@@ -660,11 +912,12 @@ def _active_state(f: Facts) -> str:
         lines.append("- Files changed in this window (last action #):")
         for p, n in list(f.files_written.items())[-15:]:
             lines.append(f"  - {p} (#{n})")
-    recent = f.calls[-6:]
-    if recent:
-        lines.append("- Most recent actions:")
-        for c in recent:
-            lines.append(f"  - #{c.index} {c.tool} {c.target}: {_one_line(c.outcome, 160)}")
+    if f.calls:
+        # the newest actions stand in full in Completed Actions (never folded); only the last one is repeated here
+        last = f.calls[-1]
+        first = f.calls[-6] if len(f.calls) >= 6 else f.calls[0]
+        lines.append(f"- Most recent actions: #{first.index}-#{last.index} (see Completed Actions); last: "
+                     f"#{last.index} {last.tool} {last.target}: {_one_line(last.outcome, 160)}")
     return "\n".join(lines) or "Unknown from this window; inspect current state."
 
 
@@ -683,21 +936,57 @@ def _common_dir(f: Facts) -> str:
     return best[1] if best else ""
 
 
-def _expand_wd(prev: dict[str, str]) -> dict[str, str]:
-    m = re.search(r"\$WD = (\S+)", prev.get("## Active State", ""))
-    if not m:
-        return prev
-    return {k: v.replace("$WD", m.group(1)) for k, v in prev.items()}
+MAX_DIR_ABBREVS = 3
+
+
+def _abbreviations(f: Facts) -> tuple:
+    """(directory, name) pairs, longest first: the working directory as $WD and up to MAX_DIR_ABBREVS other
+    long directories that many calls name, as $D1..; the best saves its length on the most lines."""
+    with diag.timer("abbreviations"):
+        wd = _common_dir(f)
+        counts: dict[str, int] = {}
+        texts_all = []
+        for c in f.calls:
+            texts = [str(c.args.get("command") or c.args.get("cmd") or "")]
+            texts += [c.args[k] for k in ("path", "file_path", "filename", "file") if isinstance(c.args.get(k), str)]
+            texts_all += texts
+            dirs = set()
+            for p in (p for t in texts for p in PATH_RE.findall(t) if p.startswith("/")):
+                parts = p.rstrip("/").split("/")
+                dirs.update("/".join(parts[:i]) for i in range(3, len(parts) + 1))
+            for d in dirs:
+                counts[d] = counts.get(d, 0) + 1
+        chosen: list[str] = []
+        for d, n in sorted(counts.items(), key=lambda kv: -(len(kv[0]) - 3) * kv[1]):
+            if len(chosen) == MAX_DIR_ABBREVS:
+                break
+            if len(d) < 25 or n < 4 or (wd and (d == wd or d.startswith(wd + "/"))):
+                continue
+            if any(d.startswith(x + "/") or x.startswith(d + "/") for x in chosen):
+                continue
+            chosen.append(d)
+        joined = "\n".join(texts_all)
+        names = [f"$D{i}" for i in range(1, 10) if f"$D{i}" not in joined]  # never a name the commands use
+        pairs = ([(wd, "$WD")] if wd else []) + list(zip(chosen, names))
+        diag.count("build.dir_abbrevs", len(pairs) - bool(wd))
+        return tuple(sorted(pairs, key=lambda pn: -len(pn[0])))
+
+
+def _expand_abbrevs(prev: dict[str, str]) -> dict[str, str]:
+    """Back to full paths in an earlier summary: this summary may name other directories."""
+    defs = re.findall(r"(?m)^- (\$WD|\$D\d) = (\S+)", prev.get("## Active State", ""))
+    for name, path in defs:
+        prev = {k: re.sub(re.escape(name) + r"(?![A-Za-z0-9_])", lambda _m, p=path: p, v) for k, v in prev.items()}
+    return prev
 
 
 def _files(f: Facts) -> str:
-    lines = []
-    for p, n in list(f.files_written.items())[-25:]:
-        lines.append(f"- {p} — modified (last at action {n})")
-    for p, n in list(f.files_read.items())[-25:]:
-        if p not in f.files_written:
-            lines.append(f"- {p} — read/used (first at action {n})")
-    return "\n".join(lines[:40])
+    written = [f"- {p} — modified (last at action {n})" for p, n in list(f.files_written.items())[-25:]]
+    # "no write seen": no write tool and no shell write (>, tee, sed -i, cp, mv) on it in this window
+    read = [f"- {p} — read/used, no write seen (first at action {n})" for p, n in list(f.files_read.items())[-25:]
+            if p not in f.files_written]
+    # modified files last: a section over its cap is cut from the top, so read-only files go first
+    return "\n".join(read[:max(0, 40 - len(written))] + written)
 
 
 def summarize(prompt: str) -> str | None:
@@ -705,8 +994,12 @@ def summarize(prompt: str) -> str | None:
     parsed = parse_prompt(prompt)
     if parsed is None:
         return None
+    return summarize_parsed(parsed)
+
+
+def summarize_parsed(parsed: Parsed, model_sections: dict[str, str] | None = None) -> str | None:
     try:
-        return build_summary(parsed)
+        return build_summary(parsed, model_sections)
     except Exception:  # never break a compaction; the model path takes over
         diag.count("build.exception")
         diag.log.exception("build_summary failed; forwarding to the model")

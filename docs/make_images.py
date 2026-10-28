@@ -26,12 +26,11 @@ THEMES = {
 FONT = "Inter" if any("Inter" in f.name for f in font_manager.fontManager.ttflist) else "DejaVu Sans"
 plt.rcParams.update({"font.family": FONT, "font.size": 12})
 
-# variant, seconds per compaction on large windows (mean), facts recalled of 96
+# variant, seconds per compaction on large windows (mean), facts recalled of 71
 ROWS = [
-    ("Model alone (Hermes default)", 198, 77),
-    ("VCC projector", 0.005, 79),
-    ("compress-fast rules only", 0.01, 84),
-    ("compress-fast hybrid", 34, 85),
+    ("Hermes standalone", 198, 59),
+    ("hermes-vcc-engine", 0.005, 63),
+    ("compress-fast (hybrid)", 31, 71),
 ]
 
 
@@ -43,7 +42,7 @@ def results(theme: str) -> None:
     c = THEMES[theme]
     names = [r[0] for r in ROWS]
     colors = [c["accent"] if "hybrid" in n else c["gray"] for n in names]
-    fig, (a, b) = plt.subplots(1, 2, figsize=(11, 3.4), dpi=150, gridspec_kw={"wspace": 0.08})
+    fig, (a, b) = plt.subplots(1, 2, figsize=(11, 2.8), dpi=150, gridspec_kw={"wspace": 0.08})
     fig.patch.set_facecolor(c["bg"])
     y = range(len(ROWS))[::-1]
     a.barh(list(y), [r[1] for r in ROWS], color=colors, height=0.55)
@@ -53,9 +52,9 @@ def results(theme: str) -> None:
     for yi, r in zip(y, ROWS):
         a.text(r[1] + 4, yi, _fmt_secs(r[1]), va="center", color=c["ink"], fontsize=11)
     b.barh(list(y), [r[2] for r in ROWS], color=colors, height=0.55)
-    b.set_xlim(0, 96)
+    b.set_xlim(0, 71)
     b.set_yticks([])
-    b.set_title("Facts recalled after compaction (of 96)", loc="left", fontsize=13, color=c["ink"], pad=10)
+    b.set_title("Facts recalled after compaction (of 71)", loc="left", fontsize=13, color=c["ink"], pad=10)
     for yi, r in zip(y, ROWS):
         b.text(r[2] - 2, yi, str(r[2]), va="center", ha="right", color=c["on_bar"], fontsize=11, weight="bold")
     for ax in (a, b):
@@ -67,7 +66,7 @@ def results(theme: str) -> None:
         ax.tick_params(axis="x", colors=c["muted"], labelsize=10)
         ax.xaxis.grid(True, color=c["grid"], linewidth=0.8)
         ax.set_axisbelow(True)
-    fig.text(0.01, -0.04, "Hermes 0.22.5, local Qwen3.8-flash-next IQ3_XXS, 8 compaction prompts, 96 quiz questions. "
+    fig.text(0.01, -0.04, "Hermes 0.22.5, local Qwen3.8-flash-next IQ3_XXS, 8 compaction prompts, 71 fact questions. "
              "Details and caveats in the README.", color=c["muted"], fontsize=9)
     fig.savefig(OUT / f"results-{theme}.png", bbox_inches="tight", pad_inches=0.25, facecolor=c["bg"])
     plt.close(fig)
@@ -79,10 +78,10 @@ def social() -> None:
     t = lambda x, y, s, **k: fig.text(x, y, s, **{"color": "#f0efec", **k})  # noqa: E731
     t(0.07, 0.80, "compress-fast", fontsize=58, weight="bold")
     t(0.07, 0.70, "Context compaction for Hermes Agent on local models", fontsize=24, color="#c3c2b7")
-    t(0.07, 0.42, "198 s → 34 s", fontsize=52, weight="bold", color="#6aa8f0")
+    t(0.07, 0.42, "198 s → 31 s", fontsize=52, weight="bold", color="#6aa8f0")
     t(0.07, 0.34, "wait per compaction", fontsize=20, color="#c3c2b7")
-    t(0.52, 0.42, "85 vs 77", fontsize=52, weight="bold", color="#6aa8f0")
-    t(0.52, 0.34, "facts kept (of 96)", fontsize=20, color="#c3c2b7")
+    t(0.52, 0.42, "71 vs 59", fontsize=52, weight="bold", color="#6aa8f0")
+    t(0.52, 0.34, "facts kept (of 71)", fontsize=20, color="#c3c2b7")
     t(0.07, 0.12, "Drop-in OpenAI-compatible proxy  ·  no Hermes patches  ·  Python stdlib  ·  MIT",
       fontsize=18, color="#898781")
     fig.savefig(OUT / "social-preview-plain.png", facecolor=fig.get_facecolor())

@@ -2,8 +2,69 @@
 
 ## Unreleased
 
-- Repository housekeeping: CI tests on Python 3.10-3.13, issue templates (bug report, Hermes update
-  compatibility), PR template, SECURITY.md, Dependabot for the CI actions, CODEOWNERS.
+### Hybrid
+
+- The answer is streamed and capped (`COMPRESS_FAST_HYBRID_MAX_TOKENS`, default 1100, was 2200).
+  At the cap or the timeout the finished sections are kept, and the finished lines of the section
+  being written, marked as cut. Before, a timeout threw the whole answer away, and a runaway
+  answer (2200 tokens, 46 s) ended in the middle of a section.
+- The prompt asks for Constraints & Preferences last, so a cut hits the section the rules already
+  carry verbatim.
+- `COMPRESS_FAST_HYBRID_EXTRA_BODY`: extra JSON fields for the call, e.g.
+  `{"top_k": 20}`; left out again when the server rejects them.
+- Critical Context no longer says "no model call" in hybrid summaries.
+
+### Size
+
+- Summaries are fitted to Hermes' token target, in hybrid mode too (the model's sections used to
+  come on top). Section caps are shares of the target. Over the target they shrink tier by tier:
+  log, verbatim last message and answers first, then notes, file list and Critical Context, then
+  actions and errors, last the constraints, oldest entries first. The goal and the model's own
+  text are never cut. Headings count towards the size.
+- `CHARS_PER_TOKEN` 3.6 -> 2.8. Measured with the model's tokenizer, large summaries have 2.7-3.3
+  chars per token; 0.3.0 summaries reached 10.6k (rules) and 12.9k tokens (hybrid) for a 7k target.
+- Every action stays answerable: the newest keep their output excerpt, older ones get one short
+  line (command and ok/FAILED), only the oldest fold per target. Completed Actions may grow from
+  40 % to 60 % of the budget for that. In a window with 177 calls the fitted summary had dropped
+  its oldest actions.
+- Up to three long directories that many calls name are defined once next to `$WD` (`$D1` ..). In
+  that window: 32.5k -> 30.3k chars for the full action list, 27.1k -> 21.8k for the short form.
+- Less repetition: the session log lists the calls between two messages as one line with action
+  numbers and outcome counts, and keeps only the start of messages quoted in full elsewhere.
+  Active State names the recent actions by number and repeats only the last one.
+
+### Content
+
+- Errors & Fixes lists every exception name of the window ("none" when there was none).
+  Constraints says when every user turn of the window is quoted in full, only when that still
+  holds after the cuts.
+- File changes keep one line each in Completed Actions (no "xN" for patches to the same file).
+- Relevant Files: "read/used, no write seen" for files without a write call or shell write;
+  read-only files are cut before modified ones.
+
+### Fixes
+
+- Exception names after a literal `\n` in escaped tool output (JSON in JSON, e.g. MCP results) are
+  found; error excerpts of such results improve too.
+- The legacy Hermes truncation marker "summary input truncated" is noted like "records ... elided".
+- `Call.target` is cached; it was recomputed ~31k times per build. Rule summaries take up to 47 ms
+  on the largest windows although fitting renders a summary up to 9 times (0.3.0: 22 ms).
+
+### Quiz and measurements
+
+- `tools/quiz.py` counts facts and negative controls apart. A fact counts by exact answer; a
+  control fails only on a false "yes" ("no" would reward a summary that only sounds complete).
+  Call questions whose shown command prefix fits calls that ended differently are void: no longer
+  generated, and not counted in stored quizzes for any variant. `--table` prints the totals.
+- Measured again on the 8 pairs (71 fact questions, 24 controls): rules and hybrid 71/71 facts,
+  none wrong, no false claims; model alone 59/71, VCC 63/71. Large windows average 6.8k (rules) and
+  6.9k tokens (hybrid) for a 7k target, single windows up to 5 % and 14 % over (0.3.0: up to 52 %
+  and 84 %). Hybrid 10-39 s; the largest window 47.8 s -> 38.7 s.
+
+### Housekeeping
+
+- CI tests on Python 3.10-3.13, issue templates (bug report, Hermes update compatibility), PR
+  template, SECURITY.md, Dependabot for the CI actions, CODEOWNERS.
 
 ## 0.3.0 - 2026-10-28
 
