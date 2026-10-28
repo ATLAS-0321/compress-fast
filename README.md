@@ -2,6 +2,25 @@
 
 Faster context compaction for [Hermes Agent](https://github.com/NousResearch/hermes-agent) on local models.
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Dependencies: none](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
+![Hermes 0.22.5](https://img.shields.io/badge/Hermes-0.22.5-purple)
+
+On a local model, every Hermes compaction stalled the agent for **about 3 minutes** on large windows.
+With compress-fast it takes **about 34 seconds**, and the summary keeps **more** of what happened:
+85 of 96 facts instead of 77. No Hermes patches, no plugin hooks: it is a small proxy you point
+`auxiliary.compression` at.
+
+![Wait per compaction and facts recalled: model alone 198 s / 77, VCC 5 ms / 79, rules only 10 ms / 84, hybrid 34 s / 85](docs/results.png)
+
+```bash
+git clone https://github.com/ATLAS-0321/compress-fast && cd compress-fast
+./install.sh --upstream http://127.0.0.1:8080 --model <your model>   # then paste the printed config block
+```
+
+## How it works
+
 When a Hermes session fills its context, Hermes asks the model configured under
 `auxiliary.compression` to summarize the older turns. On a local model that one request can
 take several minutes, and the agent waits the whole time. Long sessions also tend to lose
@@ -60,7 +79,7 @@ the next compaction.
 ## Install
 
 ```bash
-git clone <this repo> ~/compress-fast
+git clone https://github.com/ATLAS-0321/compress-fast ~/compress-fast
 cd ~/compress-fast
 ./install.sh --upstream http://127.0.0.1:8080 --model <model name>
 ```

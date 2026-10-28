@@ -16,7 +16,8 @@ First public release.
   existing quiz. Same 8 pairs: VCC 79/96 (2 confidently wrong, both tool calls whose result said
   "Error executing code" read as ok), rules 84/96, hybrid 85/96. VCC projection ~5 ms, no
   reasoning sections.
-- README for other users, MIT license.
+- README for other users with result chart (`docs/make_images.py` renders it and the social
+  preview), MIT license.
 
 ## 0.2.0 - 2026-10-28
 
