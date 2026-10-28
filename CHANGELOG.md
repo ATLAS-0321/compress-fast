@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Repository housekeeping: CI tests on Python 3.10-3.13, issue templates (bug report, Hermes update
+  compatibility), PR template, SECURITY.md, Dependabot for the CI actions.
+
 ## 0.3.0 - 2026-10-28
 
 First public release.

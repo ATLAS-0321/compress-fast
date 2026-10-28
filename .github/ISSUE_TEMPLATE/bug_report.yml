@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as described in the README
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes version
+      description: Output of `hermes --version`
+      placeholder: Hermes Agent v0.22.5
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Model server and model
+      placeholder: llama.cpp b6xxx, Qwen3-30B-A3B Q4_K_M
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [hybrid, serve, shadow]
+    validations:
+      required: true
+  - type: textarea
+    id: stats
+    attributes:
+      label: Stats
+      description: Output of `curl -s 127.0.0.1:8091/compress-fast/stats`
+      render: json
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: >-
+        Relevant lines from `~/.hermes/logs/compress-fast.log`. Do not paste prompts or summaries
+        from your sessions here unless you have checked them for private content.
+      render: text

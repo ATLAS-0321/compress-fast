@@ -1,0 +1,29 @@
+name: Not working after a Hermes update
+description: Compaction requests are forwarded to the model again (request.summary_forwarded goes up)
+labels: [hermes-compat]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        compress-fast recognizes Hermes' compaction prompt by its text. When a Hermes update changes
+        that text, requests go to your model as before and nothing breaks, but compress-fast is idle.
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes version that stopped working
+      placeholder: Hermes Agent v0.23.0
+    validations:
+      required: true
+  - type: input
+    id: last_ok
+    attributes:
+      label: Last Hermes version that worked
+      placeholder: Hermes Agent v0.22.5
+  - type: textarea
+    id: log
+    attributes:
+      label: Log lines
+      description: Lines with "not handled by rules" from `~/.hermes/logs/compress-fast.log`
+      render: text
+    validations:
+      required: true

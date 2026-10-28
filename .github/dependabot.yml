@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # the service has no dependencies; only the CI actions need updates
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

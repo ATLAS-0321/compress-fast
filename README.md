@@ -2,6 +2,7 @@
 
 Faster context compaction for [Hermes Agent](https://github.com/NousResearch/hermes-agent) on local models.
 
+[![tests](https://github.com/ATLAS-0321/compress-fast/actions/workflows/tests.yml/badge.svg)](https://github.com/ATLAS-0321/compress-fast/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Dependencies: none](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
