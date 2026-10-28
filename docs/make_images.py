@@ -1,9 +1,12 @@
-"""Render docs/results-dark.png and docs/results-light.png (README) and docs/social-preview.png
-(GitHub social preview, 1280x640).
+"""Render docs/results-dark.png and docs/results-light.png (README).
+
+docs/social-preview.png (GitHub social preview, 1280x640) is a designed card and not rendered here;
+`--social` writes the plain fallback version to docs/social-preview-plain.png.
 
 Numbers are the measurements from the README table. Needs matplotlib; not used by the service.
 Usage: python3 docs/make_images.py
 """
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -82,12 +85,13 @@ def social() -> None:
     t(0.52, 0.34, "facts kept (of 96)", fontsize=20, color="#c3c2b7")
     t(0.07, 0.12, "Drop-in OpenAI-compatible proxy  ·  no Hermes patches  ·  Python stdlib  ·  MIT",
       fontsize=18, color="#898781")
-    fig.savefig(OUT / "social-preview.png", facecolor=fig.get_facecolor())
+    fig.savefig(OUT / "social-preview-plain.png", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
 if __name__ == "__main__":
     for name in THEMES:
         results(name)
-    social()
-    print("wrote results-dark.png, results-light.png, social-preview.png to", OUT)
+    if "--social" in sys.argv:
+        social()
+    print("wrote results-dark.png, results-light.png to", OUT)
