@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-10-28
+
+Summaries stay within Hermes' size target, the reasoning answer is capped, and the quiz scores
+facts and negative controls apart.
 
 ### Hybrid
 
@@ -65,6 +68,7 @@
 
 - CI tests on Python 3.10-3.13, issue templates (bug report, Hermes update compatibility), PR
   template, SECURITY.md, Dependabot for the CI actions, CODEOWNERS.
+- README rewritten: shorter, results first; the results chart ranks the variants, best on top.
 
 ## 0.3.0 - 2026-10-28
 
