@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- README quick start: `api_key` for hosted APIs (Hermes otherwise sends a placeholder key), and
+  how to run without systemd (`install.sh` needs `systemctl`).
+
 ## 0.4.0 - 2026-10-28
 
 Summaries stay within Hermes' size target, the reasoning answer is capped, and the quiz scores

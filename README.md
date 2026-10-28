@@ -47,8 +47,14 @@ auxiliary:
 ```
 
 Restart Hermes afterwards. Hermes reads the auxiliary settings when a session starts, so only new
-sessions use compress-fast. Without systemd:
-`COMPRESS_FAST_UPSTREAM=http://127.0.0.1:8080 python3 -m compress_fast.server`.
+sessions use compress-fast.
+
+For a hosted API, add `api_key: <your key>` to the block. compress-fast passes the key on to the
+model server; without it Hermes sends the placeholder `no-key-required` and the API refuses it.
+
+Without systemd, skip `install.sh` (it needs `systemctl`), start the server from the checkout and
+add the block above by hand:
+`cd ~/compress-fast && COMPRESS_FAST_UPSTREAM=http://127.0.0.1:8080 python3 -m compress_fast.server`
 
 ## How it works
 
